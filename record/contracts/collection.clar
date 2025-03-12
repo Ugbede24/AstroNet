@@ -1,5 +1,5 @@
-;; Astronomical Data Submission with Peer Review
-;; Added peer review system and data cataloging functionality
+;; Complete Astronomical Data Collaboration Network
+;; Final implementation with incentive mechanisms and comprehensive data validation
 
 (define-constant contract-owner tx-sender)
 (define-constant err-unauthorized (err u100))
@@ -7,13 +7,21 @@
 (define-constant err-insufficient-tokens (err u102))
 (define-constant err-already-cataloged (err u103))
 (define-constant err-invalid-input (err u104))
+(define-constant err-already-reviewed (err u105))
 
 ;; Data submission token requirement
 (define-constant minimum-tokens u500)
 (define-constant max-observation-length u256)
+(define-constant max-grant-fund u1000000)
 
 ;; Grant fund for astronomical contributors
 (define-data-var grant-fund uint u10000)
+
+;; Reviewer reputation tracking
+(define-map reviewer-reputation
+  { reviewer: principal }
+  { reputation-score: uint }
+)
 
 ;; Astronomical observation structure
 (define-map celestial-observations 
@@ -41,6 +49,19 @@
   }
 )
 
+;; Track individual reviewer decisions
+(define-map review-decisions
+  {
+    celestial-id: uint,
+    observation-epoch: uint,
+    reviewer: principal
+  }
+  {
+    reviewed: bool,
+    decision: bool
+  }
+)
+
 ;; Input validation functions
 (define-private (is-valid-celestial-id (celestial-id uint))
   (and (> celestial-id u0) (<= celestial-id u10000))
@@ -50,6 +71,31 @@
   (and 
     (> (len observation-data) u0) 
     (<= (len observation-data) max-observation-length)
+  )
+)
+
+;; Helper function to get or initialize reviewer reputation
+(define-private (get-reputation (reviewer principal))
+  (default-to 
+    { reputation-score: u10 } 
+    (map-get? reviewer-reputation { reviewer: reviewer })
+  )
+)
+
+;; Update reviewer reputation
+(define-private (update-reputation (reviewer principal) (is-consensus bool))
+  (let 
+    (
+      (current-reputation (get reputation-score (get-reputation reviewer)))
+      (new-score (if is-consensus 
+                  (+ current-reputation u1) 
+                  (if (> current-reputation u1) (- current-reputation u1) u1)))
+    )
+    
+    (map-set reviewer-reputation 
+      { reviewer: reviewer }
+      { reputation-score: new-score }
+    )
   )
 )
 
@@ -168,6 +214,15 @@
           err-invalid-data
         )
       )
+      (previous-review 
+        (map-get? review-decisions
+          {
+            celestial-id: celestial-id,
+            observation-epoch: observation-epoch,
+            reviewer: tx-sender
+          }
+        )
+      )
     )
     
     ;; Validate inputs
@@ -178,6 +233,22 @@
     (asserts! 
       (not (is-eq tx-sender (get astronomer observation-entry))) 
       err-unauthorized
+    )
+    
+    ;; Prevent multiple reviews from same reviewer
+    (asserts! (is-none previous-review) err-already-reviewed)
+    
+    ;; Record this review decision
+    (map-set review-decisions
+      {
+        celestial-id: celestial-id,
+        observation-epoch: observation-epoch,
+        reviewer: tx-sender
+      }
+      {
+        reviewed: true,
+        decision: is-accurate
+      }
     )
     
     ;; Update review count
@@ -201,18 +272,40 @@
           (merge observation-entry { cataloged: true })
         )
         
-        ;; Return tokens to astronomer
+        ;; Distribute grant and return tokens
         (try! 
           (as-contract 
             (stx-transfer? 
-              minimum-tokens
+              (+ minimum-tokens (/ (var-get grant-fund) u10)) 
               tx-sender 
               (get astronomer observation-entry)
             )
           )
         )
+        
+        ;; Update reviewer reputation (positive for consensus with final decision)
+        (update-reputation tx-sender true)
       )
-      true
+      ;; If inaccurate, penalize contributor
+      (if (not is-accurate)
+        (begin
+          (try! 
+            (as-contract 
+              (stx-transfer? 
+                (/ minimum-tokens u2) 
+                tx-sender 
+                contract-owner
+              )
+            )
+          )
+          
+          ;; Update reviewer reputation (negative if not aligned with final decision)
+          (update-reputation tx-sender false)
+          
+          true
+        )
+        true
+      )
     )
     
     (ok true)
@@ -224,9 +317,38 @@
   (begin
     ;; Validate inputs
     (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
-    (asserts! (> amount u0) err-invalid-input)
+    (asserts! (and (> amount u0) (<= amount max-grant-fund)) err-invalid-input)
     
     (var-set grant-fund (+ (var-get grant-fund) amount))
+    (ok true)
+  )
+)
+
+;; Feature for high-reputation astronomers to claim extra tokens
+(define-public (claim-reputation-bonus)
+  (let 
+    (
+      (reputation-entry (get-reputation tx-sender))
+      (reputation-score (get reputation-score reputation-entry))
+      (bonus-amount (if (>= reputation-score u50) u1000 u0))
+    )
+    
+    ;; Check if reputation is high enough
+    (asserts! (>= reputation-score u50) err-unauthorized)
+    
+    ;; Check if grant fund has enough tokens
+    (asserts! (>= (var-get grant-fund) bonus-amount) err-insufficient-tokens)
+    
+    ;; Transfer bonus to reviewer
+    (try! 
+      (as-contract
+        (stx-transfer? bonus-amount tx-sender tx-sender)
+      )
+    )
+    
+    ;; Update grant fund
+    (var-set grant-fund (- (var-get grant-fund) bonus-amount))
+    
     (ok true)
   )
 )
@@ -243,4 +365,14 @@
 ;; Read-only function to get observation data
 (define-read-only (get-observation (celestial-id uint) (observation-epoch uint))
   (map-get? celestial-observations { celestial-id: celestial-id, observation-epoch: observation-epoch })
+)
+
+;; Read-only function to get reviewer reputation
+(define-read-only (get-reviewer-reputation (reviewer principal))
+  (get-reputation reviewer)
+)
+
+;; Read-only function to get grant fund balance
+(define-read-only (get-grant-fund-balance)
+  (var-get grant-fund)
 )
